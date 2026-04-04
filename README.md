@@ -39,6 +39,12 @@ Start the wrapper with a session name:
 python3 wrapper.py my-backend-api
 ```
 
+Seed a brand-new session from a file:
+
+```bash
+python3 wrapper.py my-backend-api --initial-prompt-file prompts/bootstrap.txt
+```
+
 Pass extra arguments to Codex after `--`:
 
 ```bash
@@ -53,6 +59,8 @@ INFINITE ON
 
 Once enabled, the wrapper injects `/compact` when estimated usage reaches `85%` of `--max-context-tokens`. It can do that a configurable number of times. After the compact budget is exhausted, it writes a checkpoint to `~/.agent_state/my-backend-api_state.txt` and relaunches the next generation.
 
+If `--initial-prompt-file` is provided, the file contents are sent as the first prompt only for a fresh generation-1 session. Checkpoint resume still takes priority on later generations.
+
 ## Configuration
 
 You can change the trigger behavior with flags:
@@ -62,6 +70,7 @@ python3 wrapper.py my-backend-api \
   --max-context-tokens 1050000 \
   --trigger-ratio 0.85 \
   --max-auto-compacts 1 \
+  --initial-prompt-file prompts/bootstrap.txt \
   --compact-cooldown-seconds 20 \
   --compact-reduction-ratio 0.5 \
   -- --no-alt-screen

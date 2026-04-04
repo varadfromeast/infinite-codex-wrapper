@@ -170,6 +170,11 @@ def parse_args() -> argparse.Namespace:
         help="Directory where checkpoint state and lineage metadata are stored.",
     )
     parser.add_argument(
+        "--initial-prompt-file",
+        type=Path,
+        help="Optional file whose contents are injected as the first prompt in a fresh session.",
+    )
+    parser.add_argument(
         "codex_args",
         nargs=argparse.REMAINDER,
         help="Arguments passed to the wrapped CLI. Prefix them with --.",
@@ -288,19 +293,39 @@ def inject_previous_state(
     session_name: str,
     generation: int,
     state_file: Path,
-) -> int:
+) -> tuple[int, bool]:
     if not state_file.exists():
-        return 0
+        return 0, False
 
     previous_state = state_file.read_text()
     if not previous_state.strip():
-        return 0
+        return 0, False
 
     continuation_prompt = (
         f"CONTINUING FROM {session_name}.{generation - 1}:\n{previous_state}"
     )
     child.sendline(continuation_prompt)
-    return count_tokens(continuation_prompt)
+    return count_tokens(continuation_prompt), True
+
+
+def inject_initial_prompt_file(
+    child: pexpect.spawn,
+    prompt_file: Path | None,
+) -> int:
+    if prompt_file is None:
+        return 0
+    if not prompt_file.exists():
+        announce(f"Initial prompt file not found: {prompt_file}")
+        return 0
+
+    prompt_text = prompt_file.read_text()
+    if not prompt_text.strip():
+        announce(f"Initial prompt file is empty: {prompt_file}")
+        return 0
+
+    child.sendline(prompt_text)
+    announce(f"Injected initial prompt from: {prompt_file}")
+    return count_tokens(prompt_text)
 
 
 def capture_checkpoint(child: pexpect.spawn, checkpoint_prompt: str) -> tuple[str, bool]:
@@ -345,7 +370,12 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
 
         signal.signal(signal.SIGWINCH, lambda _signum, _frame: resize_child(child))
 
-        current_tokens += inject_previous_state(child, session_name, generation, state_file)
+        injected_tokens, resumed_from_state = inject_previous_state(
+            child, session_name, generation, state_file
+        )
+        current_tokens += injected_tokens
+        if not resumed_from_state and generation == 1:
+            current_tokens += inject_initial_prompt_file(child, args.initial_prompt_file)
 
         stdin_fd = sys.stdin.fileno()
         child_fd = child.fileno()
