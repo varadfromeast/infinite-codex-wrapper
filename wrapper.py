@@ -9,6 +9,7 @@ import shutil
 import signal
 import sys
 import termios
+import time
 import tty
 from pathlib import Path
 
@@ -19,23 +20,73 @@ DEFAULT_MAX_CONTEXT_TOKENS = int(
     os.environ.get("INFINITE_CODEX_MAX_CONTEXT_TOKENS", "1050000")
 )
 DEFAULT_TRIGGER_RATIO = float(os.environ.get("INFINITE_CODEX_TRIGGER_RATIO", "0.85"))
+DEFAULT_COMPACT_COOLDOWN_SECONDS = float(
+    os.environ.get("INFINITE_CODEX_COMPACT_COOLDOWN_SECONDS", "20")
+)
+DEFAULT_COMPACT_REDUCTION_RATIO = float(
+    os.environ.get("INFINITE_CODEX_COMPACT_REDUCTION_RATIO", "0.5")
+)
+DEFAULT_REARM_RATIO = float(os.environ.get("INFINITE_CODEX_REARM_RATIO", "0.7"))
 DEFAULT_STATE_DIR = Path.home() / ".agent_state"
 ENCODING = tiktoken.get_encoding("cl100k_base")
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
-HANDOFF_PROMPT = """[System Override: Memory Limit Reached]
-Generate a state dump for your successor instance.
-1. THE PRIME DIRECTIVE
-2. CURRENT STATE
-3. RETAINED KNOWLEDGE
-4. UNRESOLVED THREADS
-5. NEXT ACTION
-CRITICAL: You MUST end your response with the exact string: [END OF DUMP]"""
+CHECKPOINT_PROMPT = """[System Override: Checkpoint Required]
+The current session is near its practical context limit. Produce a checkpoint for a successor Codex instance.
+
+This is a lossy checkpoint-resume mechanism, not an exact state transfer. Your job is to preserve the highest-value working context so the next session can continue effectively with minimal drift.
+
+Rules:
+1. Output plain text only.
+2. Follow the exact headings below in the exact order.
+3. Keep every bullet concrete and information-dense.
+4. Preserve exact file paths, commands, identifiers, errors, decisions, constraints, and next steps when known.
+5. Do not restate generic background unless it is necessary for the next move.
+6. If a section has no content, write `- None`.
+7. The final line must be exactly `[END OF DUMP]`.
+8. Do not add anything after `[END OF DUMP]`.
+
+Use this template exactly:
+
+TASK
+- One short paragraph describing the real objective and what "done" looks like.
+
+CURRENT CHECKPOINT
+- What is already completed.
+- What is partially completed.
+- What failed or remains blocked.
+
+DECISIONS THAT MUST NOT BE LOST
+- Important decisions already made.
+- Why those decisions were made.
+- Assumptions or constraints the next agent must keep.
+
+REPO STATE
+- Relevant files and what changed in each.
+- Relevant commands already run and their outcomes.
+- Relevant tool results, errors, or observations.
+
+OPEN PROBLEMS
+- Remaining bugs, risks, ambiguities, or unanswered questions.
+- For each one, say what the next agent needs to verify or decide.
+
+NEXT BEST ACTIONS
+1. The first action the next agent should take.
+2. The second action.
+3. The third action.
+
+USER PREFERENCES
+- Any stated user preferences or workflow constraints.
+
+RESUME NOTE
+- A brief note telling the next agent where to re-enter the task.
+
+[END OF DUMP]"""
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Wrap Codex in a PTY and auto-handoff near a token limit."
+        description="Wrap Codex in a PTY and auto-checkpoint near a token limit."
     )
     parser.add_argument("session_name", nargs="?", default="default-agent")
     parser.add_argument(
@@ -48,7 +99,25 @@ def parse_args() -> argparse.Namespace:
         "--trigger-ratio",
         type=float,
         default=DEFAULT_TRIGGER_RATIO,
-        help="Trigger handoff when token usage reaches this fraction of the limit.",
+        help="Trigger auto-compaction/checkpoint logic at this fraction of the limit.",
+    )
+    parser.add_argument(
+        "--compact-cooldown-seconds",
+        type=float,
+        default=DEFAULT_COMPACT_COOLDOWN_SECONDS,
+        help="How long to wait after injecting /compact before evaluating fallback.",
+    )
+    parser.add_argument(
+        "--compact-reduction-ratio",
+        type=float,
+        default=DEFAULT_COMPACT_REDUCTION_RATIO,
+        help="Heuristic local token reduction applied after auto-compaction.",
+    )
+    parser.add_argument(
+        "--rearm-ratio",
+        type=float,
+        default=DEFAULT_REARM_RATIO,
+        help="Re-arm auto-compaction once tokens fall below this fraction of the trigger point.",
     )
     parser.add_argument(
         "--command",
@@ -59,7 +128,7 @@ def parse_args() -> argparse.Namespace:
         "--state-dir",
         type=Path,
         default=DEFAULT_STATE_DIR,
-        help="Directory where handoff state and lineage metadata are stored.",
+        help="Directory where checkpoint state and lineage metadata are stored.",
     )
     parser.add_argument(
         "codex_args",
@@ -110,8 +179,9 @@ def handle_input_line(
     generation: int,
     infinite_mode: bool,
     current_tokens: int,
-) -> tuple[str, int, bool, int]:
+) -> tuple[str, int, bool, int, bool]:
     stripped = line.strip()
+    compact_seen = False
 
     if stripped == "INFINITE ON" and not infinite_mode:
         infinite_mode = True
@@ -125,18 +195,19 @@ def handle_input_line(
             f"Next rebirth will save as: {session_name}.{generation}"
         )
 
-    fork_match = re.search(r"^/fork\s+([^\s]+)$", stripped)
-    if fork_match:
-        session_name = fork_match.group(1)
+    if stripped == "/fork":
         generation = 1
         current_tokens = 0
-        announce(f"Intercepted /fork. Switched bookkeeping to: {session_name}.1")
+        announce(
+            "Intercepted /fork. Token counter reset and lineage restarted for the forked thread."
+        )
 
     if stripped == "/new":
         current_tokens = 0
         announce("Intercepted /new. Token counter reset to 0.")
 
     if stripped == "/compact":
+        compact_seen = True
         current_tokens = int(current_tokens * 0.5)
         announce("Intercepted /compact. Token counter halved heuristically.")
 
@@ -148,7 +219,7 @@ def handle_input_line(
         current_tokens = 0
         announce("Intercepted /agent. Token counter reset for the selected thread.")
 
-    return session_name, generation, infinite_mode, current_tokens
+    return session_name, generation, infinite_mode, current_tokens, compact_seen
 
 
 def inject_previous_state(
@@ -171,10 +242,14 @@ def inject_previous_state(
     return count_tokens(continuation_prompt)
 
 
-def capture_handoff(child: pexpect.spawn, handoff_prompt: str) -> str:
-    child.sendline(handoff_prompt)
-    child.expect_exact("[END OF DUMP]", timeout=120)
-    return strip_ansi(child.before).strip()
+def capture_checkpoint(child: pexpect.spawn, checkpoint_prompt: str) -> tuple[str, bool]:
+    child.sendline(checkpoint_prompt)
+    try:
+        child.expect_exact("[END OF DUMP]", timeout=120)
+        return strip_ansi(child.before).strip(), True
+    except pexpect.TIMEOUT:
+        partial_output = strip_ansi(child.before).strip()
+        return partial_output, False
 
 
 def run_agent_lineage(args: argparse.Namespace) -> None:
@@ -188,6 +263,10 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
         current_agent_id = f"{session_name}.{generation}"
         current_tokens = 0
         infinite_mode = state_file.exists()
+        auto_compact_attempted = False
+        compact_in_flight = False
+        compact_started_at = 0.0
+        pre_compact_tokens = 0
 
         announce(f"LAUNCHING {current_agent_id} (PTY Proxy Active)")
 
@@ -217,6 +296,8 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
 
             while True:
                 readable, _, _ = select.select([stdin_fd, child_fd], [], [], 0.1)
+                trigger_limit = int(args.max_context_tokens * args.trigger_ratio)
+                rearm_limit = int(trigger_limit * args.rearm_ratio)
 
                 if child_fd in readable:
                     chunk = os.read(child_fd, 4096)
@@ -259,6 +340,7 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                                 generation,
                                 infinite_mode,
                                 current_tokens,
+                                compact_seen,
                             ) = handle_input_line(
                                 line,
                                 session_name,
@@ -269,22 +351,73 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                             state_file = args.state_dir / f"{session_name}_state.txt"
                             meta_file = args.state_dir / f"{session_name}_meta.json"
                             current_agent_id = f"{session_name}.{generation}"
+                            if compact_seen:
+                                auto_compact_attempted = True
 
-                trigger_limit = int(args.max_context_tokens * args.trigger_ratio)
+                if current_tokens < rearm_limit:
+                    auto_compact_attempted = False
+
+                if compact_in_flight and (
+                    time.monotonic() - compact_started_at
+                    >= args.compact_cooldown_seconds
+                ):
+                    compact_in_flight = False
+                    reduced_estimate = int(
+                        pre_compact_tokens * args.compact_reduction_ratio
+                    )
+                    current_tokens = min(current_tokens, reduced_estimate)
+                    announce(
+                        "Auto-compaction cooldown finished. "
+                        f"Heuristic token estimate adjusted to {current_tokens}."
+                    )
+
                 if infinite_mode and current_tokens >= trigger_limit:
+                    if not auto_compact_attempted and not compact_in_flight:
+                        announce(
+                            f"Approximate usage hit {current_tokens} tokens. "
+                            "Injecting /compact before checkpoint fallback."
+                        )
+                        os.write(child_fd, b"/compact\n")
+                        compact_in_flight = True
+                        compact_started_at = time.monotonic()
+                        pre_compact_tokens = max(current_tokens, 1)
+                        auto_compact_attempted = True
+                        continue
+
+                    if compact_in_flight:
+                        continue
+
                     announce(
                         f"Approximate usage hit {current_tokens} tokens. "
-                        "Injecting handoff prompt."
+                        "Injecting checkpoint prompt."
                     )
-                    handoff_state = capture_handoff(child, HANDOFF_PROMPT)
-                    state_file.write_text(handoff_state + "\n")
-                    save_generation(meta_file, generation + 1)
+                    checkpoint_state, completed = capture_checkpoint(
+                        child, CHECKPOINT_PROMPT
+                    )
+                    if checkpoint_state:
+                        state_file.write_text(checkpoint_state + "\n")
+
+                    if completed:
+                        save_generation(meta_file, generation + 1)
+                        child.terminate(force=True)
+                        announce(f"{current_agent_id} terminated after checkpoint. Rebirthing...")
+                        break
+
+                    save_generation(meta_file, generation)
                     child.terminate(force=True)
-                    announce(f"{current_agent_id} terminated. Rebirthing...")
-                    break
+                    announce(
+                        f"Checkpoint prompt timed out for {current_agent_id}. "
+                        "Saved partial state and exiting cleanly."
+                    )
+                    return
 
         except KeyboardInterrupt:
             announce("Wrapper interrupted. Exiting.")
+            save_generation(meta_file, generation)
+            child.terminate(force=True)
+            return
+        except pexpect.TIMEOUT:
+            announce("Unexpected timeout while interacting with Codex. Exiting cleanly.")
             save_generation(meta_file, generation)
             child.terminate(force=True)
             return
