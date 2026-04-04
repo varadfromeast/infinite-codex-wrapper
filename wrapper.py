@@ -13,8 +13,20 @@ import time
 import tty
 from pathlib import Path
 
-import pexpect
-import tiktoken
+try:
+    import pexpect
+    import tiktoken
+except ModuleNotFoundError as exc:
+    missing_module = exc.name or "required dependency"
+    sys.stderr.write(
+        "Missing Python dependency: "
+        f"{missing_module}\n"
+        "Create a virtual environment and install requirements first:\n"
+        "  python3 -m venv .venv\n"
+        "  source .venv/bin/activate\n"
+        "  pip install -r requirements.txt\n"
+    )
+    raise SystemExit(1) from exc
 
 DEFAULT_MAX_CONTEXT_TOKENS = int(
     os.environ.get("INFINITE_CODEX_MAX_CONTEXT_TOKENS", "1050000")
@@ -31,23 +43,32 @@ DEFAULT_MAX_AUTO_COMPACTS = int(
 )
 DEFAULT_REARM_RATIO = float(os.environ.get("INFINITE_CODEX_REARM_RATIO", "0.7"))
 DEFAULT_STATE_DIR = Path.home() / ".agent_state"
-ENCODING = tiktoken.get_encoding("cl100k_base")
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+ENCODING = None
+ENCODING_FAILED = False
 
 CHECKPOINT_PROMPT = """[System Override: Checkpoint Required]
 The current session is near its practical context limit. Produce a checkpoint for a successor Codex instance.
 
 This is a lossy checkpoint-resume mechanism, not an exact state transfer. Your job is to preserve the highest-value working context so the next session can continue effectively with minimal drift.
 
+Priority:
+1. Preserve the exact task objective.
+2. Preserve irreversible or high-cost reasoning outcomes.
+3. Preserve constraints, failed paths, and next actions.
+4. Preserve only the context that materially helps the next agent continue.
+
 Rules:
 1. Output plain text only.
 2. Follow the exact headings below in the exact order.
-3. Keep every bullet concrete and information-dense.
+3. Keep every bullet concrete, specific, and information-dense.
 4. Preserve exact file paths, commands, identifiers, errors, decisions, constraints, and next steps when known.
-5. Do not restate generic background unless it is necessary for the next move.
-6. If a section has no content, write `- None`.
-7. The final line must be exactly `[END OF DUMP]`.
-8. Do not add anything after `[END OF DUMP]`.
+5. Do not restate generic background unless it is necessary for continuation.
+6. Do not write motivational language, filler, or vague summaries.
+7. If a section has no content, write `- None`.
+8. If something is uncertain, mark it explicitly as `Uncertain: ...`.
+9. The final line must be exactly `[END OF DUMP]`.
+10. Do not add anything after `[END OF DUMP]`.
 
 Use this template exactly:
 
@@ -58,6 +79,11 @@ CURRENT CHECKPOINT
 - What is already completed.
 - What is partially completed.
 - What failed or remains blocked.
+
+HARD DEPENDENCIES
+- Design choices or conclusions reached after careful consideration that the next agent should treat as fixed unless there is strong evidence to revisit them.
+- Include why each one matters.
+- Include any tradeoff already accepted.
 
 DECISIONS THAT MUST NOT BE LOST
 - Important decisions already made.
@@ -73,16 +99,20 @@ OPEN PROBLEMS
 - Remaining bugs, risks, ambiguities, or unanswered questions.
 - For each one, say what the next agent needs to verify or decide.
 
+FAILED OR REJECTED PATHS
+- Approaches tried and abandoned.
+- Why they failed, were rejected, or should not be retried without new evidence.
+
 NEXT BEST ACTIONS
 1. The first action the next agent should take.
 2. The second action.
 3. The third action.
 
 USER PREFERENCES
-- Any stated user preferences or workflow constraints.
+- Any stated user preferences, workflow constraints, or communication preferences.
 
 RESUME NOTE
-- A brief note telling the next agent where to re-enter the task.
+- A brief note telling the next agent exactly where to re-enter the task.
 
 [END OF DUMP]"""
 
@@ -153,11 +183,31 @@ def strip_ansi(text: str) -> str:
     return ANSI_ESCAPE_RE.sub("", text)
 
 
+def get_encoding():
+    global ENCODING, ENCODING_FAILED
+    if ENCODING is not None:
+        return ENCODING
+    if ENCODING_FAILED:
+        return None
+    try:
+        ENCODING = tiktoken.get_encoding("cl100k_base")
+        return ENCODING
+    except Exception:
+        ENCODING_FAILED = True
+        announce(
+            "Unable to load tiktoken encoding data. Falling back to a rough token estimate."
+        )
+        return None
+
+
 def count_tokens(text: str) -> int:
     cleaned = strip_ansi(text)
     if not cleaned:
         return 0
-    return len(ENCODING.encode(cleaned))
+    encoding = get_encoding()
+    if encoding is None:
+        return max(1, len(cleaned) // 4)
+    return len(encoding.encode(cleaned))
 
 
 def load_generation(meta_file: Path) -> int:
