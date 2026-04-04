@@ -1,6 +1,6 @@
 # Infinite Codex Wrapper
 
-`infinite-codex-wrapper` is a small Python PTY proxy for the local Codex CLI. It sits between your terminal and `codex`, tracks approximate token usage, tries native `/compact` first near a configurable threshold, and only falls back to a structured checkpoint plus relaunch when compaction is not enough.
+`infinite-codex-wrapper` is a small Python PTY proxy for the local Codex CLI. It sits between your terminal and `codex`, tracks approximate token usage, tries native `/compact` a configurable number of times near a threshold, and then falls back to a structured checkpoint plus relaunch.
 
 The goal is continuity, not exact state transfer. This wrapper can only estimate tokens from terminal traffic; it cannot see the model's exact server-side context or internal summarization.
 
@@ -9,7 +9,7 @@ The goal is continuity, not exact state transfer. This wrapper can only estimate
 - Preserves a normal interactive TUI by running Codex inside a PTY.
 - Tracks a named session lineage such as `my-project.1`, `my-project.2`, and so on.
 - Stores successor checkpoint state under `~/.agent_state/` by default.
-- Treats `INFINITE ON` as the opt-in switch for token tracking and hybrid rollover.
+- Treats `INFINITE ON` as the opt-in switch for token tracking and compact-then-checkpoint rollover.
 - Sniffs typed `/fork`, `/new`, `/compact`, `/resume`, and `/agent` commands as bookkeeping hints, plus `/rename` as an undocumented best-effort extension.
 
 ## Important Caveats
@@ -17,7 +17,7 @@ The goal is continuity, not exact state transfer. This wrapper can only estimate
 - The token count is approximate. It is based on visible terminal input/output after ANSI stripping, not the true model context.
 - Current OpenAI docs list a `1,050,000` token context window for `gpt-5.4`, but your Codex CLI session may use a different model or limit. Override `--max-context-tokens` if needed.
 - OpenAI's Codex CLI docs currently document interactive slash commands such as `/compact`, `/new`, `/resume`, `/fork`, and `/agent`. `/rename` is not documented there, so the wrapper treats it as a best-effort extension only.
-- The hybrid flow is heuristic: the wrapper injects `/compact`, waits a short cooldown, and adjusts its local estimate before deciding whether to checkpoint.
+- The compact phase is heuristic: the wrapper injects `/compact`, waits a short cooldown, and adjusts its local estimate before deciding whether to try again or checkpoint.
 - A forced checkpoint can still fail if the model ignores the dump format or the CLI rendering changes.
 - The checkpoint is intentionally lossy. It is designed for practical resume quality, not perfect transcript reconstruction.
 
@@ -51,7 +51,7 @@ Opt into tracking from inside the Codex prompt:
 INFINITE ON
 ```
 
-Once enabled, the wrapper first injects `/compact` when estimated usage reaches `85%` of `--max-context-tokens`. If the session still appears too full after a short cooldown, it writes a checkpoint to `~/.agent_state/my-backend-api_state.txt` and relaunches the next generation.
+Once enabled, the wrapper injects `/compact` when estimated usage reaches `85%` of `--max-context-tokens`. It can do that a configurable number of times. After the compact budget is exhausted, it writes a checkpoint to `~/.agent_state/my-backend-api_state.txt` and relaunches the next generation.
 
 ## Configuration
 
@@ -61,6 +61,7 @@ You can change the trigger behavior with flags:
 python3 wrapper.py my-backend-api \
   --max-context-tokens 1050000 \
   --trigger-ratio 0.85 \
+  --max-auto-compacts 1 \
   --compact-cooldown-seconds 20 \
   --compact-reduction-ratio 0.5 \
   -- --no-alt-screen
@@ -71,6 +72,7 @@ You can also use environment variables:
 ```bash
 export INFINITE_CODEX_MAX_CONTEXT_TOKENS=1050000
 export INFINITE_CODEX_TRIGGER_RATIO=0.85
+export INFINITE_CODEX_MAX_AUTO_COMPACTS=1
 export INFINITE_CODEX_COMPACT_COOLDOWN_SECONDS=20
 export INFINITE_CODEX_COMPACT_REDUCTION_RATIO=0.5
 python3 wrapper.py my-backend-api

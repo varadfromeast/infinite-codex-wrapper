@@ -26,6 +26,9 @@ DEFAULT_COMPACT_COOLDOWN_SECONDS = float(
 DEFAULT_COMPACT_REDUCTION_RATIO = float(
     os.environ.get("INFINITE_CODEX_COMPACT_REDUCTION_RATIO", "0.5")
 )
+DEFAULT_MAX_AUTO_COMPACTS = int(
+    os.environ.get("INFINITE_CODEX_MAX_AUTO_COMPACTS", "1")
+)
 DEFAULT_REARM_RATIO = float(os.environ.get("INFINITE_CODEX_REARM_RATIO", "0.7"))
 DEFAULT_STATE_DIR = Path.home() / ".agent_state"
 ENCODING = tiktoken.get_encoding("cl100k_base")
@@ -114,6 +117,12 @@ def parse_args() -> argparse.Namespace:
         help="Heuristic local token reduction applied after auto-compaction.",
     )
     parser.add_argument(
+        "--max-auto-compacts",
+        type=int,
+        default=DEFAULT_MAX_AUTO_COMPACTS,
+        help="How many wrapper-injected /compact attempts are allowed before checkpoint fallback.",
+    )
+    parser.add_argument(
         "--rearm-ratio",
         type=float,
         default=DEFAULT_REARM_RATIO,
@@ -135,7 +144,9 @@ def parse_args() -> argparse.Namespace:
         nargs=argparse.REMAINDER,
         help="Arguments passed to the wrapped CLI. Prefix them with --.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.max_auto_compacts = max(0, args.max_auto_compacts)
+    return args
 
 
 def strip_ansi(text: str) -> str:
@@ -263,7 +274,7 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
         current_agent_id = f"{session_name}.{generation}"
         current_tokens = 0
         infinite_mode = state_file.exists()
-        auto_compact_attempted = False
+        auto_compact_count = 0
         compact_in_flight = False
         compact_started_at = 0.0
         pre_compact_tokens = 0
@@ -351,11 +362,12 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                             state_file = args.state_dir / f"{session_name}_state.txt"
                             meta_file = args.state_dir / f"{session_name}_meta.json"
                             current_agent_id = f"{session_name}.{generation}"
-                            if compact_seen:
-                                auto_compact_attempted = True
+                            if compact_seen and compact_in_flight:
+                                auto_compact_count += 1
+                                compact_in_flight = False
 
                 if current_tokens < rearm_limit:
-                    auto_compact_attempted = False
+                    auto_compact_count = 0
 
                 if compact_in_flight and (
                     time.monotonic() - compact_started_at
@@ -372,16 +384,19 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                     )
 
                 if infinite_mode and current_tokens >= trigger_limit:
-                    if not auto_compact_attempted and not compact_in_flight:
+                    if (
+                        auto_compact_count < args.max_auto_compacts
+                        and not compact_in_flight
+                    ):
                         announce(
                             f"Approximate usage hit {current_tokens} tokens. "
-                            "Injecting /compact before checkpoint fallback."
+                            f"Injecting /compact ({auto_compact_count + 1}/"
+                            f"{args.max_auto_compacts}) before checkpoint fallback."
                         )
                         os.write(child_fd, b"/compact\n")
                         compact_in_flight = True
                         compact_started_at = time.monotonic()
                         pre_compact_tokens = max(current_tokens, 1)
-                        auto_compact_attempted = True
                         continue
 
                     if compact_in_flight:
@@ -389,7 +404,8 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
 
                     announce(
                         f"Approximate usage hit {current_tokens} tokens. "
-                        "Injecting checkpoint prompt."
+                        f"Auto-compaction budget exhausted after {auto_compact_count} "
+                        "attempt(s). Injecting checkpoint prompt."
                     )
                     checkpoint_state, completed = capture_checkpoint(
                         child, CHECKPOINT_PROMPT
