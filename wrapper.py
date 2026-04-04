@@ -118,6 +118,13 @@ RESUME NOTE
 
 
 def parse_args() -> argparse.Namespace:
+    raw_args = sys.argv[1:]
+    codex_args: list[str] = []
+    if "--" in raw_args:
+        separator_index = raw_args.index("--")
+        codex_args = raw_args[separator_index + 1 :]
+        raw_args = raw_args[:separator_index]
+
     parser = argparse.ArgumentParser(
         description="Wrap Codex in a PTY and auto-checkpoint near a token limit."
     )
@@ -174,13 +181,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional file whose contents are injected as the first prompt in a fresh session.",
     )
-    parser.add_argument(
-        "codex_args",
-        nargs=argparse.REMAINDER,
-        help="Arguments passed to the wrapped CLI. Prefix them with --.",
-    )
-    args = parser.parse_args()
+    args = parser.parse_args(raw_args)
     args.max_auto_compacts = max(0, args.max_auto_compacts)
+    args.codex_args = codex_args
     return args
 
 

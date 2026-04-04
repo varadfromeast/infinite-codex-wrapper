@@ -45,6 +45,8 @@ Seed a brand-new session from a file:
 python3 wrapper.py my-backend-api --initial-prompt-file prompts/bootstrap.txt
 ```
 
+Wrapper options can appear before or after the session name. Only arguments after a literal `--` are forwarded to Codex.
+
 Pass extra arguments to Codex after `--`:
 
 ```bash
