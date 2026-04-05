@@ -4,6 +4,8 @@
 
 The goal is continuity, not exact state transfer. This wrapper can only estimate tokens from terminal traffic; it cannot see the model's exact server-side context or internal summarization.
 
+It can also act as a Telegram-controlled supervisor: when the agent appears idle or asks for input, the wrapper can notify a Telegram bot, and `/inject` messages from the bot are queued into the live Codex session without disabling the checkpoint rollover flow.
+
 ## What It Does
 
 - Preserves a normal interactive TUI by running Codex inside a PTY.
@@ -20,6 +22,7 @@ The goal is continuity, not exact state transfer. This wrapper can only estimate
 - The compact phase is heuristic: the wrapper injects `/compact`, waits a short cooldown, and adjusts its local estimate before deciding whether to try again or checkpoint.
 - A forced checkpoint can still fail if the model ignores the dump format or the CLI rendering changes.
 - The checkpoint is intentionally lossy. It is designed for practical resume quality, not perfect transcript reconstruction.
+- Telegram input/idleness detection is heuristic. The wrapper watches visible PTY output, not hidden model state.
 
 ## Install
 
@@ -63,6 +66,51 @@ Once enabled, the wrapper injects `/compact` when estimated usage reaches `85%` 
 
 If `--initial-prompt-file` is provided, the file contents are sent as the first prompt only for a fresh generation-1 session. Checkpoint resume still takes priority on later generations.
 
+## Telegram Control Plane
+
+Set these environment variables before launching the wrapper:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_CHAT_ID=...
+```
+
+Basic Telegram bot setup:
+
+1. Open Telegram and talk to `@BotFather`.
+2. Run `/newbot` and follow the prompts.
+3. Copy the bot token BotFather gives you and export it as `TELEGRAM_BOT_TOKEN`.
+4. Start a chat with your bot and send it any message.
+5. Find your numeric chat id by calling:
+
+```bash
+curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"
+```
+
+6. Read the `message.chat.id` field from the response and export it as `TELEGRAM_CHAT_ID`.
+7. Launch the wrapper with those environment variables set.
+
+Then start the wrapper normally. Optional flags:
+
+```bash
+python3 wrapper.py my-backend-api \
+  --idle-timeout-seconds 180 \
+  --telegram-poll-seconds 5
+```
+
+Supported Telegram commands:
+
+- `/inject <text>`: queue a prompt into the ongoing agent terminal
+- `/answer <text>`: answer a detected input request
+- `/status`: show pending queue and waiting state
+
+Behavior:
+
+- If the wrapper detects that the agent is waiting for input, it sends a Telegram alert with recent output.
+- If the wrapper detects that the agent is idle for too long, it sends a Telegram idle alert.
+- Any queued `/inject` message is persisted under the session state and survives checkpoint rebirth.
+- The normal compact/checkpoint handoff flow still runs when context usage crosses the configured threshold.
+
 ## Configuration
 
 You can change the trigger behavior with flags:
@@ -73,6 +121,8 @@ python3 wrapper.py my-backend-api \
   --trigger-ratio 0.85 \
   --max-auto-compacts 1 \
   --initial-prompt-file prompts/bootstrap.txt \
+  --idle-timeout-seconds 180 \
+  --telegram-poll-seconds 5 \
   --compact-cooldown-seconds 20 \
   --compact-reduction-ratio 0.5 \
   -- --no-alt-screen

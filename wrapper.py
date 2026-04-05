@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,9 @@ import sys
 import termios
 import time
 import tty
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 try:
@@ -42,10 +46,23 @@ DEFAULT_MAX_AUTO_COMPACTS = int(
     os.environ.get("INFINITE_CODEX_MAX_AUTO_COMPACTS", "1")
 )
 DEFAULT_REARM_RATIO = float(os.environ.get("INFINITE_CODEX_REARM_RATIO", "0.7"))
+DEFAULT_IDLE_TIMEOUT_SECONDS = float(
+    os.environ.get("INFINITE_CODEX_IDLE_TIMEOUT_SECONDS", "180")
+)
+DEFAULT_TELEGRAM_POLL_SECONDS = float(
+    os.environ.get("INFINITE_CODEX_TELEGRAM_POLL_SECONDS", "5")
+)
 DEFAULT_STATE_DIR = Path.home() / ".agent_state"
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 ENCODING = None
 ENCODING_FAILED = False
+INPUT_REQUEST_PATTERNS = [
+    re.compile(
+        r"(do you want|would you like|which option|choose|select|enter|provide|please reply)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"press enter to continue", re.IGNORECASE),
+]
 
 CHECKPOINT_PROMPT = """[System Override: Checkpoint Required]
 The current session is near its practical context limit. Produce a checkpoint for a successor Codex instance.
@@ -181,6 +198,28 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional file whose contents are injected as the first prompt in a fresh session.",
     )
+    parser.add_argument(
+        "--idle-timeout-seconds",
+        type=float,
+        default=DEFAULT_IDLE_TIMEOUT_SECONDS,
+        help="Notify Telegram when the agent appears idle for this many seconds.",
+    )
+    parser.add_argument(
+        "--telegram-poll-seconds",
+        type=float,
+        default=DEFAULT_TELEGRAM_POLL_SECONDS,
+        help="How often to poll Telegram for injected messages.",
+    )
+    parser.add_argument(
+        "--telegram-bot-token-env",
+        default="TELEGRAM_BOT_TOKEN",
+        help="Environment variable containing the Telegram bot token.",
+    )
+    parser.add_argument(
+        "--telegram-chat-id-env",
+        default="TELEGRAM_CHAT_ID",
+        help="Environment variable containing the authorized Telegram chat id.",
+    )
     args = parser.parse_args(raw_args)
     args.max_auto_compacts = max(0, args.max_auto_compacts)
     args.codex_args = codex_args
@@ -235,6 +274,224 @@ def save_generation(meta_file: Path, generation: int) -> None:
 def announce(message: str) -> None:
     sys.stdout.write(f"\n[SYSTEM] {message}\n")
     sys.stdout.flush()
+
+
+def stable_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def load_json_dict(path: Path, default: dict) -> dict:
+    if not path.exists():
+        return dict(default)
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, dict):
+            merged = dict(default)
+            merged.update(data)
+            return merged
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return dict(default)
+
+
+def save_json_dict(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def load_telegram_state(state_file: Path) -> dict:
+    return load_json_dict(
+        state_file,
+        {
+            "last_update_id": 0,
+            "pending_injections": [],
+            "awaiting_input": False,
+            "last_input_request_hash": "",
+            "last_idle_alert_hash": "",
+        },
+    )
+
+
+def save_telegram_state(state_file: Path, state: dict) -> None:
+    save_json_dict(state_file, state)
+
+
+def telegram_enabled(args: argparse.Namespace) -> bool:
+    return bool(os.environ.get(args.telegram_bot_token_env)) and bool(
+        os.environ.get(args.telegram_chat_id_env)
+    )
+
+
+def telegram_api_request(
+    args: argparse.Namespace,
+    method: str,
+    payload: dict,
+) -> dict | None:
+    token = os.environ.get(args.telegram_bot_token_env)
+    if not token:
+        return None
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            body = response.read().decode("utf-8", errors="ignore")
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and parsed.get("ok"):
+            return parsed
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def telegram_send_message(
+    args: argparse.Namespace,
+    text: str,
+) -> bool:
+    chat_id = os.environ.get(args.telegram_chat_id_env)
+    if not chat_id:
+        return False
+    response = telegram_api_request(
+        args,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text[:4000],
+        },
+    )
+    return response is not None
+
+
+def poll_telegram_updates(
+    args: argparse.Namespace,
+    telegram_state: dict,
+    session_name: str,
+) -> bool:
+    chat_id = os.environ.get(args.telegram_chat_id_env)
+    if not chat_id:
+        return False
+
+    response = telegram_api_request(
+        args,
+        "getUpdates",
+        {
+            "timeout": 1,
+            "offset": telegram_state["last_update_id"] + 1,
+        },
+    )
+    if response is None:
+        return False
+
+    updated = False
+    for item in response.get("result", []):
+        update_id = int(item.get("update_id", 0))
+        telegram_state["last_update_id"] = max(telegram_state["last_update_id"], update_id)
+        message = item.get("message") or {}
+        if str(message.get("chat", {}).get("id")) != str(chat_id):
+            continue
+        text = (message.get("text") or "").strip()
+        if not text:
+            continue
+
+        if text.startswith("/inject"):
+            payload = text[len("/inject") :].strip()
+            if payload:
+                telegram_state["pending_injections"].append(payload)
+                updated = True
+                telegram_send_message(
+                    args,
+                    f"[{session_name}] queued injection ({len(telegram_state['pending_injections'])} pending).",
+                )
+            continue
+
+        if text.startswith("/answer"):
+            payload = text[len("/answer") :].strip()
+            if payload:
+                telegram_state["pending_injections"].append(payload)
+                telegram_state["awaiting_input"] = False
+                updated = True
+                telegram_send_message(args, f"[{session_name}] queued answer.")
+            continue
+
+        if text.startswith("/status"):
+            pending = len(telegram_state["pending_injections"])
+            waiting = "yes" if telegram_state["awaiting_input"] else "no"
+            telegram_send_message(
+                args,
+                f"[{session_name}] pending_injections={pending}, awaiting_input={waiting}",
+            )
+            continue
+
+        if telegram_state["awaiting_input"]:
+            telegram_state["pending_injections"].append(text)
+            telegram_state["awaiting_input"] = False
+            updated = True
+            telegram_send_message(args, f"[{session_name}] queued reply.")
+
+    return updated
+
+
+def detect_input_request(recent_output: str) -> str | None:
+    cleaned = strip_ansi(recent_output).strip()
+    if not cleaned:
+        return None
+
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    excerpt = "\n".join(lines[-8:])
+    if not excerpt:
+        return None
+
+    if any(pattern.search(excerpt) for pattern in INPUT_REQUEST_PATTERNS):
+        return excerpt
+    if lines and lines[-1].endswith("?"):
+        return excerpt
+    return None
+
+
+def notify_input_request(
+    args: argparse.Namespace,
+    telegram_state: dict,
+    telegram_state_file: Path,
+    session_name: str,
+    current_agent_id: str,
+    excerpt: str,
+) -> None:
+    request_hash = stable_hash(excerpt)
+    if telegram_state["last_input_request_hash"] == request_hash:
+        return
+
+    telegram_state["awaiting_input"] = True
+    telegram_state["last_input_request_hash"] = request_hash
+    save_telegram_state(telegram_state_file, telegram_state)
+    telegram_send_message(
+        args,
+        f"[{session_name}] {current_agent_id} is waiting for input.\n\n"
+        f"{excerpt}\n\n"
+        "Reply with plain text, or use /answer ... or /inject ...",
+    )
+
+
+def notify_idle(
+    args: argparse.Namespace,
+    telegram_state: dict,
+    telegram_state_file: Path,
+    session_name: str,
+    current_agent_id: str,
+    recent_output: str,
+) -> None:
+    excerpt = strip_ansi(recent_output).strip()
+    lines = [line.strip() for line in excerpt.splitlines() if line.strip()]
+    tail = "\n".join(lines[-8:]) if lines else "- No recent output -"
+    idle_hash = stable_hash(f"{current_agent_id}:{tail}")
+    if telegram_state["last_idle_alert_hash"] == idle_hash:
+        return
+
+    telegram_state["last_idle_alert_hash"] = idle_hash
+    save_telegram_state(telegram_state_file, telegram_state)
+    telegram_send_message(
+        args,
+        f"[{session_name}] {current_agent_id} appears idle.\n\nRecent output:\n{tail}\n\n"
+        "Use /inject ... to queue a prompt.",
+    )
 
 
 def resize_child(child: pexpect.spawn) -> None:
@@ -311,24 +568,20 @@ def inject_previous_state(
     return count_tokens(continuation_prompt), True
 
 
-def inject_initial_prompt_file(
-    child: pexpect.spawn,
-    prompt_file: Path | None,
-) -> int:
+def load_initial_prompt_file(prompt_file: Path | None) -> tuple[str | None, int]:
     if prompt_file is None:
-        return 0
+        return None, 0
     if not prompt_file.exists():
         announce(f"Initial prompt file not found: {prompt_file}")
-        return 0
+        return None, 0
 
     prompt_text = prompt_file.read_text()
     if not prompt_text.strip():
         announce(f"Initial prompt file is empty: {prompt_file}")
-        return 0
+        return None, 0
 
-    child.sendline(prompt_text)
-    announce(f"Injected initial prompt from: {prompt_file}")
-    return count_tokens(prompt_text)
+    announce(f"Loaded initial prompt from: {prompt_file}")
+    return prompt_text, count_tokens(prompt_text)
 
 
 def capture_checkpoint(child: pexpect.spawn, checkpoint_prompt: str) -> tuple[str, bool]:
@@ -348,6 +601,7 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
     while True:
         state_file = args.state_dir / f"{session_name}_state.txt"
         meta_file = args.state_dir / f"{session_name}_meta.json"
+        telegram_state_file = args.state_dir / f"{session_name}_telegram.json"
         generation = load_generation(meta_file)
         current_agent_id = f"{session_name}.{generation}"
         current_tokens = 0
@@ -356,12 +610,26 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
         compact_in_flight = False
         compact_started_at = 0.0
         pre_compact_tokens = 0
+        telegram_state = load_telegram_state(telegram_state_file)
+        last_output_at = time.monotonic()
+        last_input_at = time.monotonic()
+        last_telegram_poll_at = 0.0
+        recent_output_buffer = ""
 
         announce(f"LAUNCHING {current_agent_id} (PTY Proxy Active)")
 
         codex_args = list(args.codex_args)
         if codex_args and codex_args[0] == "--":
             codex_args = codex_args[1:]
+
+        initial_prompt_text = None
+        initial_prompt_tokens = 0
+        if generation == 1 and not state_file.exists():
+            initial_prompt_text, initial_prompt_tokens = load_initial_prompt_file(
+                args.initial_prompt_file
+            )
+            if initial_prompt_text is not None:
+                codex_args.append(initial_prompt_text)
 
         child = pexpect.spawn(
             args.command,
@@ -377,8 +645,8 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
             child, session_name, generation, state_file
         )
         current_tokens += injected_tokens
-        if not resumed_from_state and generation == 1:
-            current_tokens += inject_initial_prompt_file(child, args.initial_prompt_file)
+        if not resumed_from_state and initial_prompt_text is not None:
+            current_tokens += initial_prompt_tokens
 
         stdin_fd = sys.stdin.fileno()
         child_fd = child.fileno()
@@ -401,10 +669,26 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                         return
 
                     os.write(sys.stdout.fileno(), chunk)
+                    last_output_at = time.monotonic()
+                    decoded_chunk = chunk.decode("utf-8", errors="ignore")
+                    recent_output_buffer = (recent_output_buffer + decoded_chunk)[-8000:]
+                    if telegram_state["last_idle_alert_hash"]:
+                        telegram_state["last_idle_alert_hash"] = ""
+                        save_telegram_state(telegram_state_file, telegram_state)
                     if infinite_mode:
-                        current_tokens += count_tokens(
-                            chunk.decode("utf-8", errors="ignore")
-                        )
+                        current_tokens += count_tokens(decoded_chunk)
+
+                    if telegram_enabled(args):
+                        maybe_request = detect_input_request(recent_output_buffer)
+                        if maybe_request:
+                            notify_input_request(
+                                args,
+                                telegram_state,
+                                telegram_state_file,
+                                session_name,
+                                current_agent_id,
+                                maybe_request,
+                            )
 
                 if stdin_fd in readable:
                     chunk = os.read(stdin_fd, 1024)
@@ -412,6 +696,10 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                         child.sendeof()
                     else:
                         os.write(child_fd, chunk)
+                        last_input_at = time.monotonic()
+                        if telegram_state["last_idle_alert_hash"]:
+                            telegram_state["last_idle_alert_hash"] = ""
+                            save_telegram_state(telegram_state_file, telegram_state)
                         decoded = chunk.decode("utf-8", errors="ignore")
                         pending_input += decoded
 
@@ -444,10 +732,56 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                             )
                             state_file = args.state_dir / f"{session_name}_state.txt"
                             meta_file = args.state_dir / f"{session_name}_meta.json"
+                            new_telegram_state_file = (
+                                args.state_dir / f"{session_name}_telegram.json"
+                            )
+                            if new_telegram_state_file != telegram_state_file:
+                                telegram_state_file = new_telegram_state_file
+                                telegram_state = load_telegram_state(telegram_state_file)
                             current_agent_id = f"{session_name}.{generation}"
                             if compact_seen and compact_in_flight:
                                 auto_compact_count += 1
                                 compact_in_flight = False
+
+                now = time.monotonic()
+                if telegram_enabled(args) and (
+                    now - last_telegram_poll_at >= args.telegram_poll_seconds
+                ):
+                    if poll_telegram_updates(args, telegram_state, session_name):
+                        save_telegram_state(telegram_state_file, telegram_state)
+                    last_telegram_poll_at = now
+
+                if (
+                    telegram_enabled(args)
+                    and telegram_state["pending_injections"]
+                    and not compact_in_flight
+                ):
+                    queued_text = telegram_state["pending_injections"].pop(0)
+                    child.send(queued_text)
+                    child.send("\n")
+                    last_input_at = time.monotonic()
+                    if infinite_mode:
+                        current_tokens += count_tokens(queued_text) + count_tokens("\n")
+                    telegram_state["awaiting_input"] = False
+                    save_telegram_state(telegram_state_file, telegram_state)
+                    announce(
+                        f"Injected queued Telegram prompt ({len(telegram_state['pending_injections'])} remaining)."
+                    )
+
+                if (
+                    telegram_enabled(args)
+                    and not telegram_state["awaiting_input"]
+                    and args.idle_timeout_seconds > 0
+                    and now - max(last_output_at, last_input_at) >= args.idle_timeout_seconds
+                ):
+                    notify_idle(
+                        args,
+                        telegram_state,
+                        telegram_state_file,
+                        session_name,
+                        current_agent_id,
+                        recent_output_buffer,
+                    )
 
                 if current_tokens < rearm_limit:
                     auto_compact_count = 0
@@ -498,11 +832,13 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
 
                     if completed:
                         save_generation(meta_file, generation + 1)
+                        save_telegram_state(telegram_state_file, telegram_state)
                         child.terminate(force=True)
                         announce(f"{current_agent_id} terminated after checkpoint. Rebirthing...")
                         break
 
                     save_generation(meta_file, generation)
+                    save_telegram_state(telegram_state_file, telegram_state)
                     child.terminate(force=True)
                     announce(
                         f"Checkpoint prompt timed out for {current_agent_id}. "
@@ -513,16 +849,19 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
         except KeyboardInterrupt:
             announce("Wrapper interrupted. Exiting.")
             save_generation(meta_file, generation)
+            save_telegram_state(telegram_state_file, telegram_state)
             child.terminate(force=True)
             return
         except pexpect.TIMEOUT:
             announce("Unexpected timeout while interacting with Codex. Exiting cleanly.")
             save_generation(meta_file, generation)
+            save_telegram_state(telegram_state_file, telegram_state)
             child.terminate(force=True)
             return
         except pexpect.EOF:
             announce("Session closed manually.")
             save_generation(meta_file, generation)
+            save_telegram_state(telegram_state_file, telegram_state)
             return
         finally:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, previous_tty)

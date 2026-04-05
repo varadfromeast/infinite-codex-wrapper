@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+.build/
 venv/
 env/
 .agent_state/
