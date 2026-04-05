@@ -65,6 +65,20 @@ def test_detect_input_request_returns_none_for_regular_output():
     assert wrapper.detect_input_request(output) is None
 
 
+def test_detect_input_request_matches_tui_confirmation_choice():
+    output = """
+    $ rm -rf /Users/varad/V/repo/infinite-codex-wrapper/.build
+
+    › 1. Yes, proceed (y)
+      2. No, cancel (n)
+    """
+
+    excerpt = wrapper.detect_input_request(output)
+
+    assert excerpt is not None
+    assert "1. Yes, proceed (y)" in excerpt
+
+
 def test_telegram_state_round_trip(tmp_path):
     state_file = tmp_path / "telegram.json"
     state = wrapper.load_telegram_state(state_file)
@@ -77,6 +91,73 @@ def test_telegram_state_round_trip(tmp_path):
     assert loaded["pending_injections"] == ["continue"]
     assert loaded["awaiting_input"] is True
     assert loaded["last_update_id"] == 0
+
+
+def test_process_telegram_updates_queues_injection(monkeypatch):
+    sent_messages = []
+    monkeypatch.setattr(wrapper.os, "environ", {
+        "TELEGRAM_BOT_TOKEN": "token",
+        "TELEGRAM_CHAT_ID": "123",
+    })
+    monkeypatch.setattr(
+        wrapper,
+        "submit_telegram_send",
+        lambda executor, args, text: sent_messages.append(text),
+    )
+    args = wrapper.parse_args.__globals__["argparse"].Namespace(
+        telegram_bot_token_env="TELEGRAM_BOT_TOKEN",
+        telegram_chat_id_env="TELEGRAM_CHAT_ID",
+    )
+    state = wrapper.load_telegram_state(Path("/tmp/nonexistent-telegram-state.json"))
+    response = {
+        "result": [
+            {
+                "update_id": 7,
+                "message": {
+                    "chat": {"id": 123},
+                    "text": "/inject continue working",
+                },
+            }
+        ]
+    }
+
+    updated = wrapper.process_telegram_updates(args, state, "session", response, None)
+
+    assert updated is True
+    assert state["pending_injections"] == ["continue working"]
+    assert state["last_update_id"] == 7
+    assert sent_messages
+
+
+def test_process_telegram_updates_queues_plain_reply_when_waiting(monkeypatch):
+    monkeypatch.setattr(wrapper.os, "environ", {
+        "TELEGRAM_BOT_TOKEN": "token",
+        "TELEGRAM_CHAT_ID": "123",
+    })
+    monkeypatch.setattr(wrapper, "submit_telegram_send", lambda executor, args, text: None)
+    args = wrapper.parse_args.__globals__["argparse"].Namespace(
+        telegram_bot_token_env="TELEGRAM_BOT_TOKEN",
+        telegram_chat_id_env="TELEGRAM_CHAT_ID",
+    )
+    state = wrapper.load_telegram_state(Path("/tmp/nonexistent-telegram-state.json"))
+    state["awaiting_input"] = True
+    response = {
+        "result": [
+            {
+                "update_id": 8,
+                "message": {
+                    "chat": {"id": 123},
+                    "text": "1",
+                },
+            }
+        ]
+    }
+
+    updated = wrapper.process_telegram_updates(args, state, "session", response, None)
+
+    assert updated is True
+    assert state["pending_injections"] == ["1"]
+    assert state["awaiting_input"] is False
 
 
 def test_count_tokens_falls_back_when_encoding_is_unavailable(monkeypatch):

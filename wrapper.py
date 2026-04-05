@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -36,16 +37,6 @@ DEFAULT_MAX_CONTEXT_TOKENS = int(
     os.environ.get("INFINITE_CODEX_MAX_CONTEXT_TOKENS", "1050000")
 )
 DEFAULT_TRIGGER_RATIO = float(os.environ.get("INFINITE_CODEX_TRIGGER_RATIO", "0.85"))
-DEFAULT_COMPACT_COOLDOWN_SECONDS = float(
-    os.environ.get("INFINITE_CODEX_COMPACT_COOLDOWN_SECONDS", "20")
-)
-DEFAULT_COMPACT_REDUCTION_RATIO = float(
-    os.environ.get("INFINITE_CODEX_COMPACT_REDUCTION_RATIO", "0.5")
-)
-DEFAULT_MAX_AUTO_COMPACTS = int(
-    os.environ.get("INFINITE_CODEX_MAX_AUTO_COMPACTS", "1")
-)
-DEFAULT_REARM_RATIO = float(os.environ.get("INFINITE_CODEX_REARM_RATIO", "0.7"))
 DEFAULT_IDLE_TIMEOUT_SECONDS = float(
     os.environ.get("INFINITE_CODEX_IDLE_TIMEOUT_SECONDS", "180")
 )
@@ -62,6 +53,10 @@ INPUT_REQUEST_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(r"press enter to continue", re.IGNORECASE),
+]
+DEFINITIVE_INPUT_PATTERNS = [
+    re.compile(r"^[›>\-\*]?\s*1\.\s+yes\b", re.IGNORECASE),
+    re.compile(r"^[›>\-\*]?\s*\d+\.\s+.+\([^)]+\)\s*$", re.IGNORECASE),
 ]
 
 CHECKPOINT_PROMPT = """[System Override: Checkpoint Required]
@@ -156,31 +151,7 @@ def parse_args() -> argparse.Namespace:
         "--trigger-ratio",
         type=float,
         default=DEFAULT_TRIGGER_RATIO,
-        help="Trigger auto-compaction/checkpoint logic at this fraction of the limit.",
-    )
-    parser.add_argument(
-        "--compact-cooldown-seconds",
-        type=float,
-        default=DEFAULT_COMPACT_COOLDOWN_SECONDS,
-        help="How long to wait after injecting /compact before evaluating fallback.",
-    )
-    parser.add_argument(
-        "--compact-reduction-ratio",
-        type=float,
-        default=DEFAULT_COMPACT_REDUCTION_RATIO,
-        help="Heuristic local token reduction applied after auto-compaction.",
-    )
-    parser.add_argument(
-        "--max-auto-compacts",
-        type=int,
-        default=DEFAULT_MAX_AUTO_COMPACTS,
-        help="How many wrapper-injected /compact attempts are allowed before checkpoint fallback.",
-    )
-    parser.add_argument(
-        "--rearm-ratio",
-        type=float,
-        default=DEFAULT_REARM_RATIO,
-        help="Re-arm auto-compaction once tokens fall below this fraction of the trigger point.",
+        help="Trigger checkpoint logic at this fraction of the limit.",
     )
     parser.add_argument(
         "--command",
@@ -221,7 +192,6 @@ def parse_args() -> argparse.Namespace:
         help="Environment variable containing the authorized Telegram chat id.",
     )
     args = parser.parse_args(raw_args)
-    args.max_auto_compacts = max(0, args.max_auto_compacts)
     args.codex_args = codex_args
     return args
 
@@ -361,24 +331,25 @@ def telegram_send_message(
     return response is not None
 
 
-def poll_telegram_updates(
+def submit_telegram_send(
+    executor: ThreadPoolExecutor | None,
+    args: argparse.Namespace,
+    text: str,
+) -> None:
+    if executor is None:
+        return
+    executor.submit(telegram_send_message, args, text)
+
+
+def process_telegram_updates(
     args: argparse.Namespace,
     telegram_state: dict,
     session_name: str,
+    response: dict | None,
+    executor: ThreadPoolExecutor | None,
 ) -> bool:
     chat_id = os.environ.get(args.telegram_chat_id_env)
-    if not chat_id:
-        return False
-
-    response = telegram_api_request(
-        args,
-        "getUpdates",
-        {
-            "timeout": 1,
-            "offset": telegram_state["last_update_id"] + 1,
-        },
-    )
-    if response is None:
+    if not chat_id or response is None:
         return False
 
     updated = False
@@ -397,7 +368,8 @@ def poll_telegram_updates(
             if payload:
                 telegram_state["pending_injections"].append(payload)
                 updated = True
-                telegram_send_message(
+                submit_telegram_send(
+                    executor,
                     args,
                     f"[{session_name}] queued injection ({len(telegram_state['pending_injections'])} pending).",
                 )
@@ -409,13 +381,14 @@ def poll_telegram_updates(
                 telegram_state["pending_injections"].append(payload)
                 telegram_state["awaiting_input"] = False
                 updated = True
-                telegram_send_message(args, f"[{session_name}] queued answer.")
+                submit_telegram_send(executor, args, f"[{session_name}] queued answer.")
             continue
 
         if text.startswith("/status"):
             pending = len(telegram_state["pending_injections"])
             waiting = "yes" if telegram_state["awaiting_input"] else "no"
-            telegram_send_message(
+            submit_telegram_send(
+                executor,
                 args,
                 f"[{session_name}] pending_injections={pending}, awaiting_input={waiting}",
             )
@@ -425,7 +398,7 @@ def poll_telegram_updates(
             telegram_state["pending_injections"].append(text)
             telegram_state["awaiting_input"] = False
             updated = True
-            telegram_send_message(args, f"[{session_name}] queued reply.")
+            submit_telegram_send(executor, args, f"[{session_name}] queued reply.")
 
     return updated
 
@@ -440,6 +413,12 @@ def detect_input_request(recent_output: str) -> str | None:
     if not excerpt:
         return None
 
+    if any(
+        pattern.search(line)
+        for line in lines[-8:]
+        for pattern in DEFINITIVE_INPUT_PATTERNS
+    ):
+        return excerpt
     if any(pattern.search(excerpt) for pattern in INPUT_REQUEST_PATTERNS):
         return excerpt
     if lines and lines[-1].endswith("?"):
@@ -454,6 +433,7 @@ def notify_input_request(
     session_name: str,
     current_agent_id: str,
     excerpt: str,
+    executor: ThreadPoolExecutor | None,
 ) -> None:
     request_hash = stable_hash(excerpt)
     if telegram_state["last_input_request_hash"] == request_hash:
@@ -462,7 +442,8 @@ def notify_input_request(
     telegram_state["awaiting_input"] = True
     telegram_state["last_input_request_hash"] = request_hash
     save_telegram_state(telegram_state_file, telegram_state)
-    telegram_send_message(
+    submit_telegram_send(
+        executor,
         args,
         f"[{session_name}] {current_agent_id} is waiting for input.\n\n"
         f"{excerpt}\n\n"
@@ -477,6 +458,7 @@ def notify_idle(
     session_name: str,
     current_agent_id: str,
     recent_output: str,
+    executor: ThreadPoolExecutor | None,
 ) -> None:
     excerpt = strip_ansi(recent_output).strip()
     lines = [line.strip() for line in excerpt.splitlines() if line.strip()]
@@ -487,7 +469,8 @@ def notify_idle(
 
     telegram_state["last_idle_alert_hash"] = idle_hash
     save_telegram_state(telegram_state_file, telegram_state)
-    telegram_send_message(
+    submit_telegram_send(
+        executor,
         args,
         f"[{session_name}] {current_agent_id} appears idle.\n\nRecent output:\n{tail}\n\n"
         "Use /inject ... to queue a prompt.",
@@ -507,7 +490,6 @@ def handle_input_line(
     current_tokens: int,
 ) -> tuple[str, int, bool, int, bool]:
     stripped = line.strip()
-    compact_seen = False
 
     if stripped == "INFINITE ON" and not infinite_mode:
         infinite_mode = True
@@ -532,11 +514,6 @@ def handle_input_line(
         current_tokens = 0
         announce("Intercepted /new. Token counter reset to 0.")
 
-    if stripped == "/compact":
-        compact_seen = True
-        current_tokens = int(current_tokens * 0.5)
-        announce("Intercepted /compact. Token counter halved heuristically.")
-
     if stripped == "/resume":
         current_tokens = 0
         announce("Intercepted /resume. Token counter reset for the resumed thread.")
@@ -545,7 +522,7 @@ def handle_input_line(
         current_tokens = 0
         announce("Intercepted /agent. Token counter reset for the selected thread.")
 
-    return session_name, generation, infinite_mode, current_tokens, compact_seen
+    return session_name, generation, infinite_mode, current_tokens, False
 
 
 def inject_previous_state(
@@ -606,15 +583,13 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
         current_agent_id = f"{session_name}.{generation}"
         current_tokens = 0
         infinite_mode = state_file.exists()
-        auto_compact_count = 0
-        compact_in_flight = False
-        compact_started_at = 0.0
-        pre_compact_tokens = 0
         telegram_state = load_telegram_state(telegram_state_file)
         last_output_at = time.monotonic()
         last_input_at = time.monotonic()
         last_telegram_poll_at = 0.0
         recent_output_buffer = ""
+        telegram_executor = ThreadPoolExecutor(max_workers=2) if telegram_enabled(args) else None
+        poll_future: Future | None = None
 
         announce(f"LAUNCHING {current_agent_id} (PTY Proxy Active)")
 
@@ -688,6 +663,7 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                                 session_name,
                                 current_agent_id,
                                 maybe_request,
+                                telegram_executor,
                             )
 
                 if stdin_fd in readable:
@@ -722,7 +698,7 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                                 generation,
                                 infinite_mode,
                                 current_tokens,
-                                compact_seen,
+                                _compact_seen,
                             ) = handle_input_line(
                                 line,
                                 session_name,
@@ -739,22 +715,44 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                                 telegram_state_file = new_telegram_state_file
                                 telegram_state = load_telegram_state(telegram_state_file)
                             current_agent_id = f"{session_name}.{generation}"
-                            if compact_seen and compact_in_flight:
-                                auto_compact_count += 1
-                                compact_in_flight = False
 
                 now = time.monotonic()
-                if telegram_enabled(args) and (
-                    now - last_telegram_poll_at >= args.telegram_poll_seconds
+                if (
+                    telegram_enabled(args)
+                    and poll_future is None
+                    and now - last_telegram_poll_at >= args.telegram_poll_seconds
+                    and telegram_executor is not None
                 ):
-                    if poll_telegram_updates(args, telegram_state, session_name):
-                        save_telegram_state(telegram_state_file, telegram_state)
+                    poll_future = telegram_executor.submit(
+                        telegram_api_request,
+                        args,
+                        "getUpdates",
+                        {
+                            "timeout": 1,
+                            "offset": telegram_state["last_update_id"] + 1,
+                        },
+                    )
                     last_telegram_poll_at = now
+
+                if poll_future is not None and poll_future.done():
+                    response = None
+                    try:
+                        response = poll_future.result()
+                    except Exception:
+                        response = None
+                    if process_telegram_updates(
+                        args,
+                        telegram_state,
+                        session_name,
+                        response,
+                        telegram_executor,
+                    ):
+                        save_telegram_state(telegram_state_file, telegram_state)
+                    poll_future = None
 
                 if (
                     telegram_enabled(args)
                     and telegram_state["pending_injections"]
-                    and not compact_in_flight
                 ):
                     queued_text = telegram_state["pending_injections"].pop(0)
                     child.send(queued_text)
@@ -781,48 +779,13 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
                         session_name,
                         current_agent_id,
                         recent_output_buffer,
-                    )
-
-                if current_tokens < rearm_limit:
-                    auto_compact_count = 0
-
-                if compact_in_flight and (
-                    time.monotonic() - compact_started_at
-                    >= args.compact_cooldown_seconds
-                ):
-                    compact_in_flight = False
-                    reduced_estimate = int(
-                        pre_compact_tokens * args.compact_reduction_ratio
-                    )
-                    current_tokens = min(current_tokens, reduced_estimate)
-                    announce(
-                        "Auto-compaction cooldown finished. "
-                        f"Heuristic token estimate adjusted to {current_tokens}."
+                        telegram_executor,
                     )
 
                 if infinite_mode and current_tokens >= trigger_limit:
-                    if (
-                        auto_compact_count < args.max_auto_compacts
-                        and not compact_in_flight
-                    ):
-                        announce(
-                            f"Approximate usage hit {current_tokens} tokens. "
-                            f"Injecting /compact ({auto_compact_count + 1}/"
-                            f"{args.max_auto_compacts}) before checkpoint fallback."
-                        )
-                        os.write(child_fd, b"/compact\n")
-                        compact_in_flight = True
-                        compact_started_at = time.monotonic()
-                        pre_compact_tokens = max(current_tokens, 1)
-                        continue
-
-                    if compact_in_flight:
-                        continue
-
                     announce(
                         f"Approximate usage hit {current_tokens} tokens. "
-                        f"Auto-compaction budget exhausted after {auto_compact_count} "
-                        "attempt(s). Injecting checkpoint prompt."
+                        "Injecting checkpoint prompt."
                     )
                     checkpoint_state, completed = capture_checkpoint(
                         child, CHECKPOINT_PROMPT
@@ -864,6 +827,10 @@ def run_agent_lineage(args: argparse.Namespace) -> None:
             save_telegram_state(telegram_state_file, telegram_state)
             return
         finally:
+            if poll_future is not None:
+                poll_future.cancel()
+            if telegram_executor is not None:
+                telegram_executor.shutdown(wait=False, cancel_futures=True)
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, previous_tty)
 
 
